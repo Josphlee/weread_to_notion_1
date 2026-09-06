@@ -38,12 +38,12 @@ def get_weread_notes(cookie):
 
 
 def init_notion_client(notion_token):
-    client = Client(auth=notion_token, notion_version="2025‑09‑03")
+    # 重要：使用普通英文减号 -
+    client = Client(auth=notion_token, notion_version="2025-09-03")
     return client
 
 
 def query_exist_book_map(client, data_source_id):
-    """新版SDK 使用 data_sources.query 查询数据源"""
     book_map = {}
     response = client.data_sources.query(data_source_id=data_source_id)
     results = response["results"]
@@ -72,7 +72,6 @@ def build_notion_page_properties(note_item):
 def main():
     if len(sys.argv) !=4:
         print("usage: python weread.py WEREAD_COOKIE NOTION_TOKEN DATA_SOURCE_ID")
-        print("⚠️注意：第三个参数现在是 data_source_id，不再是旧database_id！")
         return
     weread_cookie = sys.argv[1]
     notion_token = sys.argv[2]
