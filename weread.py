@@ -7,10 +7,9 @@ from notion_client import Client
 
 def get_weread_notes(cookie):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Cookie": cookie
     }
-    # 获取书架
     url_bookshelf = "https://weread.qq.com/web/bookListInCategory/reading"
     resp = requests.get(url_bookshelf, headers=headers)
     books = resp.json().get("books", [])
@@ -19,7 +18,6 @@ def get_weread_notes(cookie):
         book_id = b["bookId"]
         book_title = b["book"]["title"]
         book_author = b["book"]["author"]
-        # 获取笔记
         url_note = f"https://weread.qq.com/web/book/note/list?bookId={book_id}"
         r_note = requests.get(url_note, headers=headers)
         note_data = r_note.json()
@@ -40,15 +38,14 @@ def get_weread_notes(cookie):
 
 
 def init_notion_client(notion_token):
-    # ==========关键修改：指定旧API版本，兼容新版 notion‑client ==========
-    client = Client(auth=notion_token, notion_version="2022-06-28")
+    client = Client(auth=notion_token, notion_version="2025‑09‑03")
     return client
 
 
-def query_exist_book_map(client, database_id):
-    """查询数据库已存在记录，book_id -> page_id"""
+def query_exist_book_map(client, data_source_id):
+    """新版SDK 使用 data_sources.query 查询数据源"""
     book_map = {}
-    response = client.databases.query(database_id=database_id)
+    response = client.data_sources.query(data_source_id=data_source_id)
     results = response["results"]
     for page in results:
         props = page["properties"]
@@ -74,17 +71,19 @@ def build_notion_page_properties(note_item):
 
 def main():
     if len(sys.argv) !=4:
-        print("usage: python weread.py WEREAD_COOKIE NOTION_TOKEN NOTION_DATABASE_ID")
+        print("usage: python weread.py WEREAD_COOKIE NOTION_TOKEN DATA_SOURCE_ID")
+        print("⚠️注意：第三个参数现在是 data_source_id，不再是旧database_id！")
         return
     weread_cookie = sys.argv[1]
     notion_token = sys.argv[2]
-    database_id = sys.argv[3]
+    data_source_id = sys.argv[3]
 
     client = init_notion_client(notion_token)
     print("开始获取微信读书笔记...")
     note_list = get_weread_notes(weread_cookie)
     print(f"共获取 {len(note_list)} 条笔记")
-    exist_map = query_exist_book_map(client, database_id)
+
+    exist_map = query_exist_book_map(client, data_source_id)
 
     for note in note_list:
         bid = note["book_id"]
@@ -95,7 +94,7 @@ def main():
             client.pages.update(page_id=page_id, properties=props)
         else:
             print(f"新建记录 book_id:{bid}")
-            client.pages.create(parent={"database_id": database_id}, properties=props)
+            client.pages.create(parent={"database_id": data_source_id}, properties=props)
         time.sleep(0.3)
     print("同步完成")
 
