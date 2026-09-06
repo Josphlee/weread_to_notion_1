@@ -1,372 +1,103 @@
-
-
-import argparse
 import json
-import logging
 import time
-from notion_client import Client
+import re
+import sys
 import requests
-from requests.utils import cookiejar_from_dict
-from http.cookies import SimpleCookie
-from datetime import datetime
+from notion_client import Client
 
-WEREAD_URL = "https://weread.qq.com/"
-WEREAD_NOTEBOOKS_URL = "https://i.weread.qq.com/user/notebooks"
-WEREAD_BOOKMARKLIST_URL = "https://i.weread.qq.com/book/bookmarklist"
-WEREAD_CHAPTER_INFO = "https://i.weread.qq.com/book/chapterInfos"
-WEREAD_READ_INFO_URL = "https://i.weread.qq.com/book/readinfo"
-WEREAD_REVIEW_LIST_URL = "https://i.weread.qq.com/review/list"
-WEREAD_REVIEW_BOOK_INFO = "https://i.weread.qq.com/book/info"
-
-
-def parse_cookie_string(cookie_string):
-    cookie = SimpleCookie()
-    cookie.load(cookie_string)
-    cookies_dict = {}
-    cookiejar = None
-    for key, morsel in cookie.items():
-        cookies_dict[key] = morsel.value
-        cookiejar = cookiejar_from_dict(
-            cookies_dict, cookiejar=None, overwrite=True
-        )
-    return cookiejar
-
-
-def get_bookmark_list(bookId):
-    """获取我的划线"""
-    params = dict(bookId=bookId)
-    r = session.get(WEREAD_BOOKMARKLIST_URL, params=params)
-    if r.ok:
-        updated = r.json().get("updated")
-        updated = sorted(updated, key=lambda x: (
-            x.get("chapterUid", 1), int(x.get("range").split("-")[0])))
-        return r.json()["updated"]
-    return None
-
-
-def get_read_info(bookId):
-    params = dict(bookId=bookId, readingDetail=1,
-                  readingBookIndex=1, finishedDate=1)
-    r = session.get(WEREAD_READ_INFO_URL, params=params)
-    if r.ok:
-        return r.json()
-    return None
-
-
-def get_bookinfo(bookId):
-    """获取书的详情"""
-    url = ""
-    params = dict(bookId=bookId)
-    r = session.get(url, params=params)
-    isbn = ""
-    if r.ok:
-        data = r.json()
-        isbn = data["isbn"]
-        title = data["title"]
-    return isbn
-
-
-def get_review_list(bookId):
-    """获取笔记"""
-    params = dict(bookId=bookId, listType=11, mine=1, syncKey=0)
-    r = session.get(WEREAD_REVIEW_LIST_URL, params=params)
-    reviews = r.json().get("reviews")
-    summary = list(filter(lambda x: x.get("review").get("type") == 4, reviews))
-    reviews = list(filter(lambda x: x.get("review").get("type") == 1, reviews))
-    reviews = list(map(lambda x: x.get("review"), reviews))
-    reviews = list(map(lambda x: {**x, "markText": x.pop("content")}, reviews))
-    return summary, reviews
-
-
-def get_table_of_contents():
-    """获取目录"""
-    return {
-        "type": "table_of_contents",
-        "table_of_contents": {
-            "color": "default"
-        }
+def get_weread_notes(cookie):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+        "Cookie": cookie
     }
+    # 获取书架
+    url_bookshelf = "https://weread.qq.com/web/bookListInCategory/reading"
+    resp = requests.get(url_bookshelf, headers=headers)
+    books = resp.json().get("books", [])
+    all_notes = []
+    for b in books:
+        book_id = b["bookId"]
+        book_title = b["book"]["title"]
+        book_author = b["book"]["author"]
+        # 获取笔记
+        url_note = f"https://weread.qq.com/web/book/note/list?bookId={book_id}"
+        r_note = requests.get(url_note, headers=headers)
+        note_data = r_note.json()
+        marks = note_data.get("marks", [])
+        for mark in marks:
+            note_item = {
+                "book_id": book_id,
+                "book_title": book_title,
+                "book_author": book_author,
+                "mark_text": mark.get("markText", ""),
+                "note_text": mark.get("noteText", ""),
+                "chapter_title": mark.get("chapterTitle", ""),
+                "range": mark.get("range", ""),
+                "create_time": mark.get("createTime", int(time.time()*1000))
+            }
+            all_notes.append(note_item)
+    return all_notes
 
 
-def get_heading(level, content):
-    if level == 1:
-        heading = "heading_1"
-    elif level == 2:
-        heading = "heading_2"
-    else:
-        heading = "heading_3"
-    return {
-        "type": heading,
-        heading: {
-            "rich_text": [{
-                "type": "text",
-                "text": {
-                    "content": content,
-                }
-            }],
-            "color": "default",
-            "is_toggleable": False
-        }
+def init_notion_client(notion_token):
+    # ==========关键修改：指定旧API版本，兼容新版 notion‑client ==========
+    client = Client(auth=notion_token, notion_version="2022-06-28")
+    return client
+
+
+def query_exist_book_map(client, database_id):
+    """查询数据库已存在记录，book_id -> page_id"""
+    book_map = {}
+    response = client.databases.query(database_id=database_id)
+    results = response["results"]
+    for page in results:
+        props = page["properties"]
+        bid = props.get("book_id", {}).get("rich_text", [])
+        if bid:
+            bid_val = bid[0]["text"]["content"]
+            book_map[bid_val] = page["id"]
+    return book_map
+
+
+def build_notion_page_properties(note_item):
+    props = {
+        "book_id": {"rich_text": [{"text": {"content": note_item["book_id"]}}]},
+        "书名": {"title": [{"text": {"content": note_item["book_title"]}}]},
+        "作者": {"rich_text": [{"text": {"content": note_item["book_author"]}}]},
+        "章节": {"rich_text": [{"text": {"content": note_item["chapter_title"]}}]},
+        "划线内容": {"rich_text": [{"text": {"content": note_item["mark_text"]}}]},
+        "我的笔记": {"rich_text": [{"text": {"content": note_item["note_text"]}}]},
+        "位置": {"rich_text": [{"text": {"content": note_item["range"]}}]}
     }
+    return props
 
 
-def get_quote(content):
-    return {
-        "type": "quote",
-        "quote": {
-            "rich_text": [{
-                "type": "text",
-                "text": {
-                    "content": content
-                },
-            }],
-            "color": "default"
-        }
-    }
+def main():
+    if len(sys.argv) !=4:
+        print("usage: python weread.py WEREAD_COOKIE NOTION_TOKEN NOTION_DATABASE_ID")
+        return
+    weread_cookie = sys.argv[1]
+    notion_token = sys.argv[2]
+    database_id = sys.argv[3]
 
+    client = init_notion_client(notion_token)
+    print("开始获取微信读书笔记...")
+    note_list = get_weread_notes(weread_cookie)
+    print(f"共获取 {len(note_list)} 条笔记")
+    exist_map = query_exist_book_map(client, database_id)
 
-def get_callout(content, style, colorStyle, reviewId):
-    # 根据不同的划线样式设置不同的emoji 直线type=0 背景颜色是1 波浪线是2
-    emoji = "🌟"
-    if style == 0:
-        emoji = "💡"
-    elif style == 1:
-        emoji = "⭐"
-    # 如果reviewId不是空说明是笔记
-    if reviewId != None:
-        emoji = "✍️"
-    color = "default"
-    # 根据划线颜色设置文字的颜色
-    if colorStyle == 1:
-        color = "red"
-    elif colorStyle == 2:
-        color = "purple"
-    elif colorStyle == 3:
-        color = "blue"
-    elif colorStyle == 4:
-        color = "green"
-    elif colorStyle == 5:
-        color = "yellow"
-    return {
-        "type": "callout",
-        "callout": {
-            "rich_text": [{
-                "type": "text",
-                "text": {
-                    "content": content,
-                }
-            }],
-            "icon": {
-                "emoji": emoji
-            },
-            "color": color
-        }
-    }
-
-
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
-    time.sleep(0.3)
-    filter = {
-        "property": "BookId",
-        "rich_text": {
-            "equals": bookId
-        }
-    }
-    response = client.databases.query(database_id=database_id, filter=filter)
-    for result in response["results"]:
+    for note in note_list:
+        bid = note["book_id"]
+        props = build_notion_page_properties(note)
+        if bid in exist_map:
+            page_id = exist_map[bid]
+            print(f"更新已有记录 book_id:{bid}")
+            client.pages.update(page_id=page_id, properties=props)
+        else:
+            print(f"新建记录 book_id:{bid}")
+            client.pages.create(parent={"database_id": database_id}, properties=props)
         time.sleep(0.3)
-        client.blocks.delete(block_id=result["id"])
-
-
-def get_chapter_info(bookId):
-    """获取章节信息"""
-    body = {
-        'bookIds': [bookId],
-        'synckeys': [0],
-        'teenmode': 0
-    }
-    url = 'https://i.weread.qq.com/book/chapterInfos'
-    r = session.post(url, json=body)
-    if r.ok and "data" in r.json() and len(r.json()["data"]) == 1 and "updated" in r.json()["data"][0]:
-        update = r.json()["data"][0]["updated"]
-        return {item["chapterUid"]: item for item in update}
-    return None
-
-
-def insert_to_notion(bookName, bookId, cover, sort, author):
-    """插入到notion"""
-    time.sleep(0.3)
-    parent = {
-        "database_id": database_id,
-        "type": "database_id"
-    }
-    properties = {
-        "BookName": {"title": [{"type": "text", "text": {"content": bookName}}]},
-        "BookId": {"rich_text": [{"type": "text", "text": {"content": bookId}}]},
-        "Author": {"rich_text": [{"type": "text", "text": {"content": author}}]},
-        "Sort": {"number": sort},
-        "Cover": {"files": [{"type": "external", "name": "Cover", "external": {"url": cover}}]},
-    }
-    read_info = get_read_info(bookId=bookId)
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        properties["Status"] = {"select": {
-            "name": "读完" if markedStatus == 4 else "在读"}}
-        properties["ReadingTime"] = {"rich_text": [
-            {"type": "text", "text": {"content": format_time}}]}
-        if "finishedDate" in read_info:
-            properties["Date"] = {"date": {"start": datetime.utcfromtimestamp(read_info.get(
-                "finishedDate")).strftime("%Y-%m-%d %H:%M:%S"), "time_zone": "Asia/Shanghai"}}
-
-    icon = {
-        "type": "external",
-        "external": {
-            "url": cover
-        }
-    }
-    # notion api 限制100个block
-    response = client.pages.create(
-        parent=parent, icon=icon, properties=properties)
-    id = response["id"]
-    return id
-
-
-def add_children(id, children):
-    results = []
-    for i in range(0, len(children)//100+1):
-        time.sleep(0.3)
-        response = client.blocks.children.append(
-            block_id=id, children=children[i*100:(i+1)*100])
-        results.extend(response.get("results"))
-    return results if len(results) == len(children) else None
-
-
-def add_grandchild(grandchild, results):
-    for key, value in grandchild.items():
-        time.sleep(0.3)
-        id = results[key].get("id")
-        client.blocks.children.append(block_id=id, children=[value])
-
-
-def get_notebooklist():
-    """获取笔记本列表"""
-    r = session.get(WEREAD_NOTEBOOKS_URL)
-    if r.ok:
-        data = r.json()
-        books = data.get("books")
-        books.sort(key=lambda x: x["sort"])
-        return books
-    return None
-
-
-def get_sort():
-    """获取database中的最新时间"""
-    filter = {
-        "property": "Sort",
-        "number": {
-            "is_not_empty": True
-        }
-    }
-    sorts = [
-        {
-            "property": "Sort",
-            "direction": "descending",
-        }
-    ]
-    response = client.databases.query(
-        database_id=database_id, filter=filter, sorts=sorts, page_size=1)
-    if (len(response.get("results")) == 1):
-        return response.get("results")[0].get("properties").get("Sort").get("number")
-    return 0
-
-
-def get_children(chapter, summary, bookmark_list):
-    children = []
-    grandchild = {}
-    if chapter != None:
-        # 添加目录
-        children.append(get_table_of_contents())
-        d = {}
-        for data in bookmark_list:
-            chapterUid = data.get("chapterUid", 1)
-            if (chapterUid not in d):
-                d[chapterUid] = []
-            d[chapterUid].append(data)
-        for key, value in d .items():
-            if key in chapter:
-                # 添加章节
-                children.append(get_heading(
-                    chapter.get(key).get("level"), chapter.get(key).get("title")))
-            for i in value:
-                callout = get_callout(
-                    i.get("markText"), data.get("style"), i.get("colorStyle"), i.get("reviewId"))
-                children.append(callout)
-                if i.get("abstract") != None and i.get("abstract") != "":
-                    quote = get_quote(i.get("abstract"))
-                    grandchild[len(children)-1] = quote
-
-    else:
-        # 如果没有章节信息
-        for data in bookmark_list:
-            children.append(get_callout(data.get("markText"),
-                            data.get("style"), data.get("colorStyle"), data.get("reviewId")))
-    if summary != None and len(summary) > 0:
-        children.append(get_heading(1, "点评"))
-        for i in summary:
-            children.append(get_callout(i.get("review").get("content"), i.get(
-                "style"), i.get("colorStyle"), i.get("review").get("reviewId")))
-    return children, grandchild
-
+    print("同步完成")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("weread_cookie")
-    parser.add_argument("notion_token")
-    parser.add_argument("database_id")
-    options = parser.parse_args()
-    weread_cookie = options.weread_cookie
-    database_id = options.database_id
-    notion_token = options.notion_token
-    session = requests.Session()
-    session.cookies = parse_cookie_string(weread_cookie)
-    client = Client(
-        auth=notion_token,
-        log_level=logging.ERROR
-    )
-    print("Getting information from weread website...")
-    session.get(WEREAD_URL)
-    latest_sort = get_sort()
-    books = get_notebooklist()
-    if (books != None):
-        print("Extracting and writing information to notion database...")
-        for book in books:
-            sort = book["sort"]
-            if sort <= latest_sort:
-                continue
-            book = book.get("book")
-            title = book.get("title")
-            cover = book.get("cover")
-            bookId = book.get("bookId")
-            author = book.get("author")
-            check(bookId)
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(bookmark_list, key=lambda x: (
-                x.get("chapterUid", 1), 0 if x.get("range", "") == "" else int(x.get("range").split("-")[0])))
-            children, grandchild = get_children(
-                chapter, summary, bookmark_list)
-            id = insert_to_notion(title, bookId, cover, sort, author)
-            results = add_children(id, children)
-            if(len(grandchild)>0 and results!=None):
-                add_grandchild(grandchild, results)
+    main()
